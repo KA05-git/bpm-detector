@@ -59,7 +59,10 @@ const WINDOW_SEC = 8;           // analysis window
 const HOP_MS = 500;             // re-estimate twice a second
 const RECENCY_SEC = 3;          // newer beats count more; older ones fade out of the vote
 const SAMPLE_MS = 20;           // fixed envelope sampling (50 Hz), independent of screen refresh
-const MIN_LEVEL = 0.003;        // below this loudness we call it silence
+const MIN_LEVEL = 0.0004;       // only a dead or muted mic is below this; quiet music is fine
+const MIN_DEPTH = 0.15;         // the beat envelope must swing at least this much (steady hiss and hum barely swing)
+const MIN_SHARE = 0.5;          // this share of the tempo votes must agree (random noise votes scatter)
+const PITCH_ABOVE_NOISE_DB = 16;// a pitch must stand this far above the spectrum's own noise level
 
 let ctx, analyser, stream, running = false;
 let envTimes = [], envVals = [];  // energy envelope history
@@ -74,11 +77,11 @@ const MIN = [6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34,3.17];
 const KEY_STEP_MS = 250;
 const KEY_DECAY = Math.pow(0.5, KEY_STEP_MS / 8000);   // pitch memory fades with an 8 s half-life
 const KEY_MIN_WEIGHT = 16;                              // about 5 s of music before the first answer
-const KEY_FLOOR_DB = -80;                               // quieter than this is treated as no music
+const KEY_FLOOR_DB = -105;                               // quieter than this is treated as no music
 let analyser2 = null, freqBuf = null, keyTimer = null;
 let chroma = new Float64Array(12), chromaWeight = 0;
 let shownKey = -1, candKey = -1, candCount = 0;
-const NOTE_FLOOR_DB = -78;
+const NOTE_FLOOR_DB = -105;
 let nowCand = '', nowCount = 0, nowQuiet = 0;
 const nowEl = document.getElementById('now');
 const nowHzEl = document.getElementById('nowhz');
@@ -148,7 +151,7 @@ function stop() {
 }
 
 const buf = new Float32Array(1024);
-let lastRms = 0, diagExtra = '';
+let lastRms = 0, diagExtra = '', lastDepth = 0, lastShare = 0, failCount = 0;
 const diagEl = document.getElementById('diag');
 let lastBeatFlash = 0;
 
@@ -172,8 +175,13 @@ function loop() {
   raf = requestAnimationFrame(loop);
 }
 
+function rhythmFail(msg) {
+  statusEl.textContent = msg;
+  if (++failCount >= 3) { smoothBpm = null; bpmEl.textContent = '--'; clearInterval(pulseTimer); }   // keep the last answer for a moment, then clear
+}
+
 function estimate() {
-  diagEl.textContent = 'audio ' + ctx.state + ' · bass level ' + lastRms.toFixed(4) + ' · readings ' + envTimes.length + diagExtra;
+  diagEl.textContent = 'audio ' + ctx.state + ' · bass level ' + lastRms.toFixed(4) + ' · readings ' + envTimes.length + ' · rhythm ' + lastDepth.toFixed(2) + '/' + lastShare.toFixed(2) + diagExtra;
   if (ctx.state !== 'running') { statusEl.textContent = 'The browser paused audio. Tap Stop, then Start again.'; return; }
   if (envTimes.length < 60) return;
   const tNow = envTimes[envTimes.length-1];
@@ -187,9 +195,15 @@ function estimate() {
     smoothBpm = null;
     bpmEl.textContent = '--';
     clearInterval(pulseTimer);
-    statusEl.textContent = 'No music detected. Turn it up or move closer to the mic.';
+    statusEl.textContent = 'Nothing heard. Check that the mic is on, or turn the music up.';
     return;
   }
+
+  // steady noise (hiss, hum, fan) hardly changes in loudness; music with a beat swings a lot
+  const sortedEnv = Array.from(envVals).sort((p, q) => p - q);
+  const p10 = sortedEnv[Math.floor(sortedEnv.length * 0.1)], p90 = sortedEnv[Math.floor(sortedEnv.length * 0.9)];
+  lastDepth = (p90 - p10) / (p90 + 1e-9);
+  if (lastDepth < MIN_DEPTH) return rhythmFail('Only steady sound heard, no beat to measure.');
 
   // onset strength = positive change in smoothed energy
   const n = envVals.length;
@@ -213,7 +227,7 @@ function estimate() {
       if (!peaks.length || t - peaks[peaks.length-1] > 0.25) peaks.push(t);
     }
   }
-  if (peaks.length < 5) { statusEl.textContent = 'Not hearing a clear beat yet...'; return; }
+  if (peaks.length < 5) return rhythmFail('Not hearing a clear beat yet...');
 
   // histogram vote on inter-peak intervals (also test 2x and 3x gaps), recent beats weighted higher
   const bins = new Float32Array(MAX_BPM + 2);
@@ -232,6 +246,12 @@ function estimate() {
   let best = MIN_BPM, bestV = 0;
   for (let b = MIN_BPM; b <= MAX_BPM; b++) if (bins[b] > bestV) { bestV = bins[b]; best = b; }
 
+  // do the tempo votes agree, or are they scattered like noise?
+  let total = 0; for (let b = MIN_BPM; b <= MAX_BPM; b++) total += bins[b];
+  let near = 0; for (let b = Math.max(MIN_BPM, best - 3); b <= Math.min(MAX_BPM, best + 3); b++) near += bins[b];
+  lastShare = total > 0 ? near / total : 0;
+  if (lastShare < MIN_SHARE) return rhythmFail('Sound is there but no steady beat yet...');
+  failCount = 0;
   // follow small drift smoothly; jump when a clearly different tempo shows up twice in a row
   if (smoothBpm === null) { smoothBpm = best; pending = 0; }
   else if (Math.abs(best - smoothBpm) / smoothBpm > 0.06) {
@@ -250,14 +270,21 @@ function resetKey() {
   nowCand = ''; nowCount = 0; nowQuiet = 0; nowEl.textContent = '--'; nowHzEl.textContent = '';
 }
 
+// mains hum (50/60 Hz and its low harmonics) is a steady tone that is not music, so those exact frequencies are skipped
+function isHum(f) {
+  if (f > 300) return false;   // hum is strongest at low multiples; above this a notch would start erasing real notes (F4 is under 1 Hz from 350)
+  for (const base of [50, 60]) { const m = Math.round(f / base); if (m >= 1 && Math.abs(f - m * base) < 1.3) return true; }
+  return false;
+}
+
 // strongest pitch in the current spectrum; if its octave-below partner is also present, report that instead
-function nowStep() {
+function nowStep(floorAt) {
   const binHz = ctx.sampleRate / analyser2.fftSize;
   const lo = Math.ceil(80 / binHz), hi = Math.floor(1500 / binHz);
   let bk = -1, bd = -Infinity;
   for (let k = lo; k <= hi; k++) {
     const b = freqBuf[k];
-    if (Number.isFinite(b) && b > bd && b > freqBuf[k-1] && b >= freqBuf[k+1]) { bd = b; bk = k; }
+    if (Number.isFinite(b) && b > bd && b > freqBuf[k-1] && b >= freqBuf[k+1] && b >= floorAt(k) + PITCH_ABOVE_NOISE_DB + 4 && !isHum(k * binHz)) { bd = b; bk = k; }
   }
   if (bk < 0 || bd < NOTE_FLOOR_DB) {
     if (++nowQuiet >= 4) { nowCand = ''; nowCount = 0; nowEl.textContent = '--'; nowHzEl.textContent = ''; setLive(-1); }
@@ -271,7 +298,7 @@ function nowStep() {
     if (f0 / 2 < 70 || kk < 3) break;
     let mk = -1, md = -Infinity;
     for (let k = kk - 2; k <= kk + 2; k++) if (freqBuf[k] > md && freqBuf[k] > freqBuf[k-1] && freqBuf[k] >= freqBuf[k+1]) { md = freqBuf[k]; mk = k; }
-    if (mk > 0 && md >= bd - 8) f0 = refine(mk); else break;
+    if (mk > 0 && md >= bd - 8 && md >= floorAt(mk) + PITCH_ABOVE_NOISE_DB) f0 = refine(mk); else break;
   }
   const r = Math.round(69 + 12 * Math.log2(f0 / 440));
   const name = NOTES[((r % 12) + 12) % 12] + (Math.floor(r / 12) - 1);
@@ -286,27 +313,32 @@ function keyStep() {
 function keyStepInner() {
   if (!running || !analyser2) return;
   analyser2.getFloatFrequencyData(freqBuf);
-  nowStep();
   const binHz = ctx.sampleRate / analyser2.fftSize;
   const lo = Math.max(2, Math.ceil(70 / binHz)), hi = Math.floor(2200 / binHz);
   const frame = new Float64Array(12);
-  let sum = 0, maxDb = -Infinity;
+  let sum = 0, maxDb = -Infinity, peakCount = 0;
+  // the spectrum's own noise level around each frequency (average in dB over about +/-130 Hz): tones stand far above it, hiss and rumble do not
+  const nb = freqBuf.length, pre = new Float64Array(nb + 1);
+  for (let k = 0; k < nb; k++) pre[k + 1] = pre[k] + (Number.isFinite(freqBuf[k]) ? freqBuf[k] : -140);
+  const floorAt = (k) => { const a0 = Math.max(0, k - 48), b0 = Math.min(nb - 1, k + 48); return (pre[b0 + 1] - pre[a0]) / (b0 - a0 + 1); };
+  nowStep(floorAt);
   for (let k = lo; k <= hi; k++) {
     const b = freqBuf[k];
     if (!Number.isFinite(b)) continue;
     if (b > maxDb) maxDb = b;
     const a = freqBuf[k-1], c = freqBuf[k+1];
-    if (b < KEY_FLOOR_DB || !(b > a) || !(b >= c)) continue;
+    if (b < KEY_FLOOR_DB || b < floorAt(k) + PITCH_ABOVE_NOISE_DB || !(b > a) || !(b >= c)) continue;
     const den = a - 2*b + c;
     const delta = den !== 0 ? 0.5 * (a - c) / den : 0;       // refine the peak between bins
+    if (isHum((k + delta) * binHz)) continue;
     const midi = 69 + 12 * Math.log2(((k + delta) * binHz) / 440);
     const r = Math.round(midi);
     if (Math.abs(midi - r) > 0.35) continue;                  // between notes, ignore
     const m = Math.pow(10, b / 20);
-    frame[((r % 12) + 12) % 12] += m; sum += m;
+    frame[((r % 12) + 12) % 12] += m; sum += m; peakCount++;
   }
   diagExtra = ' · loudest pitch ' + (Number.isFinite(maxDb) ? Math.round(maxDb) + ' dB' : 'none');
-  if (maxDb < KEY_FLOOR_DB || sum === 0) return;              // silence: keep what we had
+  if (peakCount < 3 || sum === 0) return;                     // only noise this slice: keep what we had
   for (let i = 0; i < 12; i++) chroma[i] = chroma[i] * KEY_DECAY + frame[i] / sum;
   chromaWeight = chromaWeight * KEY_DECAY + 1;
   if (chromaWeight < KEY_MIN_WEIGHT) { modeEl.textContent = 'Listening for the key...'; return; }
