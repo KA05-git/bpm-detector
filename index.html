@@ -37,6 +37,24 @@
   .nt { font-size:10px; text-anchor:middle; fill:#12141a; font-weight:600; pointer-events:none; }
   .nt.on-black { fill:#fff; }
   .fg { font-size:13px; text-anchor:middle; fill:#3ddc97; font-weight:700; }
+  #heard { width:min(640px,94vw); display:flex; flex-direction:column; gap:8px; }
+  #heardhead { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+  #chips { display:flex; flex-wrap:wrap; gap:8px; min-height:38px; align-items:center; }
+  #chipsempty { opacity:.5; font-size:14px; }
+  .chip { background:#171a20; color:#eee; border:1.5px solid #3a3f4a; border-radius:999px; padding:8px 14px; font-size:16px; font-weight:600; cursor:pointer; touch-action:manipulation; }
+  .chip.new { border-color:#3ddc97; color:#3ddc97; }
+  .chip:focus-visible, .small:focus-visible, #mclose:focus-visible, #mplay:focus-visible { outline:3px solid #5aa9ff; outline-offset:2px; }
+  .tiny { background:transparent; color:#eee; border:1.5px solid #3a3f4a; padding:6px 14px; font-size:13px; font-weight:500; }
+  #modal { position:fixed; inset:0; background:rgba(0,0,0,.7); display:flex; align-items:center; justify-content:center; padding:16px; z-index:50; }
+  #modal[hidden] { display:none; }
+  #mcard { position:relative; background:#171a20; border:1px solid #2b303a; border-radius:18px; padding:22px 18px 18px; width:min(520px,100%); max-height:100%; overflow:auto; display:flex; flex-direction:column; gap:12px; align-items:stretch; }
+  #mclose { position:absolute; top:10px; right:10px; background:transparent; color:#eee; border:1.5px solid #3a3f4a; border-radius:50%; width:36px; height:36px; padding:0; font-size:16px; }
+  #mtitle { font-size:56px; font-weight:700; letter-spacing:-2px; line-height:1; color:#ffb454; }
+  #msub { opacity:.75; font-size:15px; }
+  #mkb { width:100%; height:auto; display:block; }
+  #mhow { font-size:15px; line-height:1.5; }
+  #mhow p { margin:0 0 8px; }
+  #mplay { align-self:flex-start; }
   #scaleTxt { font-size:15px; opacity:.85; text-align:center; }
   #fingerTxt { font-size:13px; opacity:.6; text-align:center; max-width:46ch; }
 </style>
@@ -54,10 +72,25 @@
     <div id="scaleTxt"></div>
     <div id="fingerTxt"></div>
   </div>
+  <div id="heard">
+    <div id="heardhead"><div class="nl">NOTES HEARD <span id="heardn"></span></div><button id="clearNotes" class="tiny">Clear</button></div>
+    <div id="chips"></div>
+  </div>
   <canvas id="scope" width="1280" height="240"></canvas>
   <div id="btns"><button id="btn">Start listening</button><button id="tap">Tap tempo</button><span id="mul"><button id="half" class="small">÷2</button><button id="dbl" class="small">×2</button></span></div>
   <div id="status">Tap start and play a song near the mic.</div>
   <div id="diag"></div>
+
+<div id="modal" hidden>
+  <div id="mcard" role="dialog" aria-modal="true" aria-labelledby="mtitle">
+    <button id="mclose" aria-label="Close">✕</button>
+    <div id="mtitle"></div>
+    <div id="msub"></div>
+    <svg id="mkb" viewBox="0 0 420 118" role="img" aria-label="Piano keyboard with this note marked"></svg>
+    <div id="mhow"></div>
+    <button id="mplay">Hear it</button>
+  </div>
+</div>
 
 <script>
 const MIN_BPM = 70, MAX_BPM = 180;
@@ -405,6 +438,7 @@ function keyStepInner() {
   const lo = Math.max(2, Math.ceil(70 / binHz)), hi = Math.floor(2200 / binHz);
   const frame = new Float64Array(12);
   let sum = 0, maxDb = -Infinity, peakCount = 0;
+  const peaks = [];
   // the spectrum's own noise level around each frequency (average in dB over about +/-130 Hz): tones stand far above it, hiss and rumble do not
   const nb = freqBuf.length, pre = new Float64Array(nb + 1);
   for (let k = 0; k < nb; k++) pre[k + 1] = pre[k] + (Number.isFinite(freqBuf[k]) ? freqBuf[k] : -140);
@@ -424,9 +458,11 @@ function keyStepInner() {
     if (Math.abs(midi - r) > 0.35) continue;                  // between notes, ignore
     const m = Math.pow(10, b / 20);
     frame[((r % 12) + 12) % 12] += m; sum += m; peakCount++;
+    peaks.push({ f: (k + delta) * binHz, b, r });
   }
   diagExtra = ' · loudest pitch ' + (Number.isFinite(maxDb) ? Math.round(maxDb) + ' dB' : 'none');
-  if (peakCount < 3 || sum === 0) return;                     // only noise this slice: keep what we had
+  if (peakCount < 3 || sum === 0) { noteStreak = new Map(); return; }   // only noise this slice: keep what we had
+  noteStep(peaks);
   for (let i = 0; i < 12; i++) chroma[i] = chroma[i] * KEY_DECAY + frame[i] / sum;
   chromaWeight = chromaWeight * KEY_DECAY + 1;
   if (chromaWeight < KEY_MIN_WEIGHT) { modeEl.textContent = 'Listening for the key...'; return; }
@@ -557,6 +593,127 @@ function setLive(midiNote) {
   liveMidi = midiNote; applyLive();
 }
 try { buildKeyboard(); } catch (e) { diagExtra = ' · keyboard error: ' + e.message; }
+
+// ---- notes heard: every distinct note (pitch + octave) once, newest highlighted ----
+const heard = new Set();
+let noteStreak = new Map();
+const NOTES_STORE = 'bpmDetectorNotes';
+const chipsEl = document.getElementById('chips'), heardN = document.getElementById('heardn');
+function noteName(m) { return NOTES[((m % 12) + 12) % 12] + (Math.floor(m / 12) - 1); }
+function noteHz(m) { return 440 * Math.pow(2, (m - 69) / 12); }
+function saveHeard() { try { localStorage.setItem(NOTES_STORE, JSON.stringify(Array.from(heard))); } catch (e) {} }
+let newestChip = -1;
+function renderChips() {
+  chipsEl.textContent = '';
+  const list = Array.from(heard).sort((a, b) => a - b);
+  heardN.textContent = list.length ? '· ' + list.length : '';
+  if (!list.length) {
+    const e = document.createElement('span'); e.id = 'chipsempty'; e.textContent = 'Notes you play or that are in the song will collect here, each one once.'; chipsEl.appendChild(e); return;
+  }
+  for (const m of list) {
+    const b = document.createElement('button');
+    b.className = 'chip' + (m === newestChip ? ' new' : ''); b.textContent = noteName(m);
+    b.setAttribute('aria-label', 'How to play ' + noteName(m));
+    b.addEventListener('click', () => openNote(m));
+    chipsEl.appendChild(b);
+  }
+}
+function addNote(m) {
+  if (heard.has(m)) return;
+  heard.add(m); newestChip = m; renderChips(); saveHeard();
+  setTimeout(() => { if (newestChip === m) { newestChip = -1; renderChips(); } }, 1500);
+}
+// all pitches in this slice, minus overtones of lower notes, kept only if they last about half a second
+function noteStep(peaks) {
+  const cand = peaks.filter(p => p.r >= 36 && p.r <= 84).sort((a, b) => b.b - a.b);
+  const next = new Map();
+  if (cand.length) {
+    const top = cand[0].b, keep = [];
+    for (const p of cand) {
+      if (p.b < top - 22 || keep.length >= 6) break;
+      let overtone = false;
+      for (let d = 2; d <= 6 && !overtone; d++) {
+        const rm = Math.round(69 + 12 * Math.log2(p.f / d / 440));
+        if (cand.some(q => q !== p && q.r === rm && q.b >= p.b - 15)) overtone = true;
+      }
+      if (!overtone) keep.push(p.r);
+    }
+    for (const m of keep) { const c = (noteStreak.get(m) || 0) + 1; next.set(m, c); if (c >= 2) addNote(m); }
+  }
+  noteStreak = next;
+}
+document.getElementById('clearNotes').addEventListener('click', () => { heard.clear(); newestChip = -1; renderChips(); saveHeard(); });
+try { const saved = JSON.parse(localStorage.getItem(NOTES_STORE) || '[]'); if (Array.isArray(saved)) saved.forEach(m => { if (Number.isInteger(m) && m >= 12 && m <= 120) heard.add(m); }); } catch (e) {}
+renderChips();
+
+// how to find each note on a piano, using the black-key landmarks
+const FIND = {
+  0: 'White key just left of a group of 2 black keys.',
+  1: 'Black key: the left one of the group of 2.',
+  2: 'White key between the 2 black keys of the pair.',
+  3: 'Black key: the right one of the group of 2.',
+  4: 'White key just right of the group of 2 black keys.',
+  5: 'White key just left of a group of 3 black keys.',
+  6: 'Black key: the left one of the group of 3.',
+  7: 'White key between the first and second black keys of the group of 3.',
+  8: 'Black key: the middle one of the group of 3.',
+  9: 'White key between the second and third black keys of the group of 3.',
+  10: 'Black key: the right one of the group of 3.',
+  11: 'White key just right of the group of 3 black keys.'
+};
+function drawModalKeys(m) {
+  const svg = document.getElementById('mkb'); svg.textContent = '';
+  const oct = Math.floor(m / 12), pc = m % 12;
+  const lo = (pc >= 6 ? oct - 1 : oct) * 12, hi = lo + 24;     // two octaves, with the note placed so there is room on both sides
+  const W = 28, TOP = 18, blacks = []; let wi = 0;
+  for (let n = lo; n <= hi; n++) {
+    const p = n % 12;
+    if (WHITE_PC.includes(p)) {
+      const x = wi * W, on = n === m;
+      svg.appendChild(svgEl('rect', { x, y: TOP, width: W, height: 96, rx: 3, class: 'wk' + (on ? ' rt' : '') }));
+      if (p === 0 || on) svg.appendChild(svgEl('text', { x: x + W / 2, y: TOP + 88, class: 'nt', style: on ? 'font-size:12px;font-weight:800' : '' }, noteName(n)));
+      if (n === 60) svg.appendChild(svgEl('text', { x: x + 2, y: 11, class: 'fg', style: 'fill:#98a2b1;font-size:10px;font-weight:600;text-anchor:start' }, 'middle C'));
+      wi++;
+    } else blacks.push({ n, x: wi * W });
+  }
+  for (const b of blacks) {
+    const on = b.n === m;
+    svg.appendChild(svgEl('rect', { x: b.x - 9, y: TOP, width: 18, height: 60, rx: 2, class: 'bk' + (on ? ' rt' : '') }));
+    if (on) svg.appendChild(svgEl('text', { x: b.x, y: TOP + 50, class: 'nt on-black', style: 'font-size:10px;font-weight:800' }, noteName(b.n)));
+  }
+  svg.setAttribute('viewBox', '0 0 ' + (wi * W) + ' 118');
+}
+let modalOpener = null, playCtx = null;
+function openNote(m) {
+  const name = noteName(m), pc = m % 12, oct = Math.floor(m / 12) - 1;
+  document.getElementById('mtitle').textContent = name;
+  const octDiff = oct - 4;
+  document.getElementById('msub').textContent = Math.round(noteHz(m)) + ' Hz · ' + (octDiff === 0 ? 'the octave starting at middle C' : Math.abs(octDiff) + (Math.abs(octDiff) === 1 ? ' octave ' : ' octaves ') + (octDiff > 0 ? 'above' : 'below') + ' middle C');
+  drawModalKeys(m);
+  const how = document.getElementById('mhow'); how.textContent = '';
+  const add = (t) => { const p = document.createElement('p'); p.textContent = t; how.appendChild(p); };
+  add(FIND[pc]);
+  add((m >= 60 ? 'Usually played with the right hand' : 'Usually played with the left hand') + ' (middle C and above go to the right). Any finger works for a single note; keep the others relaxed above the keys.');
+  add('The amber key above is ' + name + '. Every ' + NOTES[pc] + ' on the piano is the same note in a different octave.');
+  modalOpener = document.activeElement;
+  document.getElementById('modal').hidden = false;
+  document.getElementById('mclose').focus();
+  document.getElementById('mplay').onclick = () => playNote(m);
+}
+function closeNote() { document.getElementById('modal').hidden = true; if (modalOpener && modalOpener.focus) modalOpener.focus(); }
+function playNote(m) {
+  try {
+    if (!playCtx) playCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (playCtx.state === 'suspended') playCtx.resume();
+    const o = playCtx.createOscillator(), g = playCtx.createGain(), t = playCtx.currentTime;
+    o.type = 'triangle'; o.frequency.value = noteHz(m);
+    g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.35, t + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t + 1.6);
+    o.connect(g); g.connect(playCtx.destination); o.start(t); o.stop(t + 1.7);
+  } catch (e) {}
+}
+document.getElementById('mclose').addEventListener('click', closeNote);
+document.getElementById('modal').addEventListener('click', (e) => { if (e.target.id === 'modal') closeNote(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !document.getElementById('modal').hidden) closeNote(); });
 
 // visual metronome pulse at the detected tempo
 let pulseTimer = null;
