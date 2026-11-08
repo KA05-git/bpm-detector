@@ -26,14 +26,15 @@
 
 <script>
 const MIN_BPM = 70, MAX_BPM = 180;
-const WINDOW_SEC = 12;          // analysis window
-const HOP_MS = 1000;            // re-estimate every second
+const WINDOW_SEC = 8;           // analysis window
+const HOP_MS = 500;             // re-estimate twice a second
+const RECENCY_SEC = 3;          // newer beats count more; older ones fade out of the vote
 const SAMPLE_MS = 20;           // fixed envelope sampling (50 Hz), independent of screen refresh
 const MIN_LEVEL = 0.01;         // below this loudness we call it silence
 
 let ctx, analyser, stream, running = false;
 let envTimes = [], envVals = [];  // energy envelope history
-let smoothBpm = null, timer = null, raf = null, sampler = null;
+let smoothBpm = null, pending = 0, timer = null, raf = null, sampler = null;
 
 const bpmEl = document.getElementById('bpm');
 const statusEl = document.getElementById('status');
@@ -60,10 +61,10 @@ async function start() {
   analyser.fftSize = 1024;
   src.connect(lp); lp.connect(analyser);
 
-  envTimes = []; envVals = []; smoothBpm = null;
+  envTimes = []; envVals = []; smoothBpm = null; pending = 0;
   running = true;
   btn.textContent = 'Stop';
-  statusEl.textContent = 'Listening... needs about 6 seconds of music.';
+  statusEl.textContent = 'Listening... needs about 4 seconds of music.';
   sampler = setInterval(sample, SAMPLE_MS);
   loop();
   timer = setInterval(estimate, HOP_MS);
@@ -104,8 +105,9 @@ function loop() {
 
 function estimate() {
   if (envTimes.length < 60) return;
-  const dur = envTimes[envTimes.length-1] - envTimes[0];
-  if (dur < 6) return;
+  const tNow = envTimes[envTimes.length-1];
+  const dur = tNow - envTimes[0];
+  if (dur < 4) return;
 
   // silence gate: if the signal never gets loud, there is no music to measure
   let peakLevel = 0;
@@ -140,9 +142,9 @@ function estimate() {
       if (!peaks.length || t - peaks[peaks.length-1] > 0.25) peaks.push(t);
     }
   }
-  if (peaks.length < 6) { statusEl.textContent = 'Not hearing a clear beat yet...'; return; }
+  if (peaks.length < 5) { statusEl.textContent = 'Not hearing a clear beat yet...'; return; }
 
-  // histogram vote on inter-peak intervals (also test 2x and 3x gaps)
+  // histogram vote on inter-peak intervals (also test 2x and 3x gaps), recent beats weighted higher
   const bins = new Float32Array(MAX_BPM + 2);
   for (let i = 0; i < peaks.length; i++) {
     for (let j = i+1; j < Math.min(i+4, peaks.length); j++) {
@@ -150,15 +152,21 @@ function estimate() {
       while (bpm < MIN_BPM) bpm *= 2;
       while (bpm > MAX_BPM) bpm /= 2;
       const b = Math.round(bpm);
+      const wgt = Math.exp(-(tNow - peaks[j]) / RECENCY_SEC);
       if (b >= MIN_BPM && b <= MAX_BPM) {
-        bins[b] += 1; bins[b-1] += 0.5; bins[b+1] += 0.5;
+        bins[b] += wgt; bins[b-1] += 0.5 * wgt; bins[b+1] += 0.5 * wgt;
       }
     }
   }
   let best = MIN_BPM, bestV = 0;
   for (let b = MIN_BPM; b <= MAX_BPM; b++) if (bins[b] > bestV) { bestV = bins[b]; best = b; }
 
-  smoothBpm = smoothBpm === null ? best : smoothBpm * 0.7 + best * 0.3;
+  // follow small drift smoothly; jump when a clearly different tempo shows up twice in a row
+  if (smoothBpm === null) { smoothBpm = best; pending = 0; }
+  else if (Math.abs(best - smoothBpm) / smoothBpm > 0.06) {
+    pending++;
+    if (pending >= 2) { smoothBpm = best; pending = 0; }
+  } else { pending = 0; smoothBpm = smoothBpm * 0.5 + best * 0.5; }
   bpmEl.textContent = Math.round(smoothBpm);
   statusEl.textContent = 'Locked on. Peaks heard: ' + peaks.length;
   flash(60 / smoothBpm);
