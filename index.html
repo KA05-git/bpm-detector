@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BPM Detector</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; min-height:100vh; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:20px; background:#0e0f12; color:#eee; font-family:-apple-system,system-ui,sans-serif; }
+  #bpm { font-size:110px; font-weight:700; letter-spacing:-3px; }
+  #label { opacity:.6; margin-top:-24px; letter-spacing:4px; font-size:14px; }
+  #pulse { width:36px; height:36px; border-radius:50%; background:#3ddc97; opacity:.15; transition:opacity .08s; }
+  #pulse.on { opacity:1; }
+  canvas { width:min(640px,92vw); height:120px; background:#16181d; border-radius:12px; }
+  button { background:#3ddc97; color:#0e0f12; border:0; border-radius:999px; padding:14px 34px; font-size:17px; font-weight:600; cursor:pointer; }
+  #status { opacity:.55; font-size:14px; }
+</style>
+</head>
+<body>
+  <div id="bpm">--</div>
+  <div id="label">BPM</div>
+  <div id="pulse"></div>
+  <canvas id="scope" width="1280" height="240"></canvas>
+  <button id="btn">Start listening</button>
+  <div id="status">Tap start and play a song near the mic.</div>
+
+<script>
+const MIN_BPM = 70, MAX_BPM = 180;
+const WINDOW_SEC = 12;          // analysis window
+const HOP_MS = 1000;            // re-estimate every second
+const SAMPLE_MS = 20;           // fixed envelope sampling (50 Hz), independent of screen refresh
+const MIN_LEVEL = 0.01;         // below this loudness we call it silence
+
+let ctx, analyser, stream, running = false;
+let envTimes = [], envVals = [];  // energy envelope history
+let smoothBpm = null, timer = null, raf = null, sampler = null;
+
+const bpmEl = document.getElementById('bpm');
+const statusEl = document.getElementById('status');
+const pulse = document.getElementById('pulse');
+const btn = document.getElementById('btn');
+const scope = document.getElementById('scope');
+const sctx = scope.getContext('2d');
+
+btn.onclick = () => running ? stop() : start();
+
+async function start() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation:false, noiseSuppression:false, autoGainControl:false } });
+  } catch (e) {
+    statusEl.textContent = 'Mic access denied or unavailable.';
+    return;
+  }
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const src = ctx.createMediaStreamSource(stream);
+  // low-pass so kick/bass drive the beat detection
+  const lp = ctx.createBiquadFilter();
+  lp.type = 'lowpass'; lp.frequency.value = 150; lp.Q.value = 0.7;
+  analyser = ctx.createAnalyser();
+  analyser.fftSize = 1024;
+  src.connect(lp); lp.connect(analyser);
+
+  envTimes = []; envVals = []; smoothBpm = null;
+  running = true;
+  btn.textContent = 'Stop';
+  statusEl.textContent = 'Listening... needs about 6 seconds of music.';
+  sampler = setInterval(sample, SAMPLE_MS);
+  loop();
+  timer = setInterval(estimate, HOP_MS);
+}
+
+function stop() {
+  running = false;
+  clearInterval(timer); clearInterval(sampler); clearInterval(pulseTimer); cancelAnimationFrame(raf);
+  bpmEl.textContent = '--';
+  pulse.classList.remove('on');
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  if (ctx) ctx.close();
+  btn.textContent = 'Start listening';
+  statusEl.textContent = 'Stopped.';
+}
+
+const buf = new Float32Array(1024);
+let lastBeatFlash = 0;
+
+// audio sampling runs on a fixed timer so tempo math never depends on frame rate
+function sample() {
+  if (!running) return;
+  analyser.getFloatTimeDomainData(buf);
+  let sum = 0;
+  for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+  const rms = Math.sqrt(sum / buf.length);
+  const t = ctx.currentTime;
+  envTimes.push(t); envVals.push(rms);
+  while (envTimes.length && t - envTimes[0] > WINDOW_SEC) { envTimes.shift(); envVals.shift(); }
+}
+
+// drawing only; this can run at whatever rate the screen allows
+function loop() {
+  if (!running) return;
+  draw();
+  raf = requestAnimationFrame(loop);
+}
+
+function estimate() {
+  if (envTimes.length < 60) return;
+  const dur = envTimes[envTimes.length-1] - envTimes[0];
+  if (dur < 6) return;
+
+  // silence gate: if the signal never gets loud, there is no music to measure
+  let peakLevel = 0;
+  for (const v of envVals) if (v > peakLevel) peakLevel = v;
+  if (peakLevel < MIN_LEVEL) {
+    smoothBpm = null;
+    bpmEl.textContent = '--';
+    clearInterval(pulseTimer);
+    statusEl.textContent = 'No music detected. Turn it up or move closer to the mic.';
+    return;
+  }
+
+  // onset strength = positive change in smoothed energy
+  const n = envVals.length;
+  const sm = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    let a = 0, c = 0;
+    for (let k = -2; k <= 2; k++) { const j = i + k; if (j >= 0 && j < n) { a += envVals[j]; c++; } }
+    sm[i] = a / c;
+  }
+  const onset = new Float32Array(n);
+  for (let i = 1; i < n; i++) onset[i] = Math.max(0, sm[i] - sm[i-1]);
+
+  // adaptive threshold peak picking
+  let mean = 0; for (const v of onset) mean += v; mean /= n;
+  let varr = 0; for (const v of onset) varr += (v-mean)*(v-mean);
+  const thr = mean + Math.sqrt(varr / n) * 1.2;
+  const peaks = [];
+  for (let i = 2; i < n-2; i++) {
+    if (onset[i] > thr && onset[i] >= onset[i-1] && onset[i] >= onset[i+1]) {
+      const t = envTimes[i];
+      if (!peaks.length || t - peaks[peaks.length-1] > 0.25) peaks.push(t);
+    }
+  }
+  if (peaks.length < 6) { statusEl.textContent = 'Not hearing a clear beat yet...'; return; }
+
+  // histogram vote on inter-peak intervals (also test 2x and 3x gaps)
+  const bins = new Float32Array(MAX_BPM + 2);
+  for (let i = 0; i < peaks.length; i++) {
+    for (let j = i+1; j < Math.min(i+4, peaks.length); j++) {
+      let bpm = 60 / ((peaks[j]-peaks[i]) / (j-i));
+      while (bpm < MIN_BPM) bpm *= 2;
+      while (bpm > MAX_BPM) bpm /= 2;
+      const b = Math.round(bpm);
+      if (b >= MIN_BPM && b <= MAX_BPM) {
+        bins[b] += 1; bins[b-1] += 0.5; bins[b+1] += 0.5;
+      }
+    }
+  }
+  let best = MIN_BPM, bestV = 0;
+  for (let b = MIN_BPM; b <= MAX_BPM; b++) if (bins[b] > bestV) { bestV = bins[b]; best = b; }
+
+  smoothBpm = smoothBpm === null ? best : smoothBpm * 0.7 + best * 0.3;
+  bpmEl.textContent = Math.round(smoothBpm);
+  statusEl.textContent = 'Locked on. Peaks heard: ' + peaks.length;
+  flash(60 / smoothBpm);
+}
+
+// visual metronome pulse at the detected tempo
+let pulseTimer = null;
+function flash(periodSec) {
+  clearInterval(pulseTimer);
+  pulseTimer = setInterval(() => {
+    pulse.classList.add('on');
+    setTimeout(() => pulse.classList.remove('on'), 90);
+  }, periodSec * 1000);
+}
+
+function draw() {
+  const w = scope.width, h = scope.height;
+  sctx.clearRect(0, 0, w, h);
+  sctx.strokeStyle = '#3ddc97'; sctx.lineWidth = 2; sctx.beginPath();
+  const n = envVals.length;
+  let max = 0.001; for (const v of envVals) if (v > max) max = v;
+  for (let i = 0; i < n; i++) {
+    const x = (i / Math.max(n-1,1)) * w;
+    const y = h - (envVals[i] / max) * (h - 10) - 5;
+    i ? sctx.lineTo(x, y) : sctx.moveTo(x, y);
+  }
+  sctx.stroke();
+}
+</script>
+</body>
+</html>
