@@ -20,6 +20,7 @@
   canvas { width:min(640px,92vw); height:120px; background:#16181d; border-radius:12px; }
   button { background:#3ddc97; color:#0e0f12; border:0; border-radius:999px; padding:14px 34px; font-size:17px; font-weight:600; cursor:pointer; }
   #status { opacity:.55; font-size:14px; }
+  #diag { opacity:.4; font-size:12px; font-variant-numeric:tabular-nums; }
   #kbwrap { width:min(640px,94vw); display:flex; flex-direction:column; gap:8px; align-items:center; }
   #kb { width:100%; height:auto; display:block; }
   .wk { fill:#e9eaee; stroke:#4a4f5a; stroke-width:1; }
@@ -50,6 +51,7 @@
   <canvas id="scope" width="1280" height="240"></canvas>
   <button id="btn">Start listening</button>
   <div id="status">Tap start and play a song near the mic.</div>
+  <div id="diag"></div>
 
 <script>
 const MIN_BPM = 70, MAX_BPM = 180;
@@ -57,7 +59,7 @@ const WINDOW_SEC = 8;           // analysis window
 const HOP_MS = 500;             // re-estimate twice a second
 const RECENCY_SEC = 3;          // newer beats count more; older ones fade out of the vote
 const SAMPLE_MS = 20;           // fixed envelope sampling (50 Hz), independent of screen refresh
-const MIN_LEVEL = 0.01;         // below this loudness we call it silence
+const MIN_LEVEL = 0.003;        // below this loudness we call it silence
 
 let ctx, analyser, stream, running = false;
 let envTimes = [], envVals = [];  // energy envelope history
@@ -72,11 +74,11 @@ const MIN = [6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34,3.17];
 const KEY_STEP_MS = 250;
 const KEY_DECAY = Math.pow(0.5, KEY_STEP_MS / 8000);   // pitch memory fades with an 8 s half-life
 const KEY_MIN_WEIGHT = 16;                              // about 5 s of music before the first answer
-const KEY_FLOOR_DB = -70;                               // quieter than this is treated as no music
+const KEY_FLOOR_DB = -80;                               // quieter than this is treated as no music
 let analyser2 = null, freqBuf = null, keyTimer = null;
 let chroma = new Float64Array(12), chromaWeight = 0;
 let shownKey = -1, candKey = -1, candCount = 0;
-const NOTE_FLOOR_DB = -65;
+const NOTE_FLOOR_DB = -78;
 let nowCand = '', nowCount = 0, nowQuiet = 0;
 const nowEl = document.getElementById('now');
 const nowHzEl = document.getElementById('nowhz');
@@ -93,13 +95,17 @@ const sctx = scope.getContext('2d');
 btn.onclick = () => running ? stop() : start();
 
 async function start() {
+  // iPhone Safari only allows audio if it is started inside the tap, so create it before asking for the mic
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  try { ctx.resume(); } catch (e) {}
   try {
     stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation:false, noiseSuppression:false, autoGainControl:false } });
   } catch (e) {
     statusEl.textContent = 'Mic access denied or unavailable.';
+    try { ctx.close(); } catch (e2) {}
     return;
   }
-  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  try { await ctx.resume(); } catch (e) {}
   const src = ctx.createMediaStreamSource(stream);
   // low-pass so kick/bass drive the beat detection
   const lp = ctx.createBiquadFilter();
@@ -107,21 +113,26 @@ async function start() {
   analyser = ctx.createAnalyser();
   analyser.fftSize = 1024;
   src.connect(lp); lp.connect(analyser);
-  // second analyser, full range and finer resolution, for pitch content
-  analyser2 = ctx.createAnalyser();
-  analyser2.fftSize = 16384; analyser2.smoothingTimeConstant = 0.5; analyser2.minDecibels = -120;
-  freqBuf = new Float32Array(analyser2.frequencyBinCount);
-  src.connect(analyser2);
-  resetKey();
 
-  envTimes = []; envVals = []; smoothBpm = null; pending = 0;
+  envTimes = []; envVals = []; smoothBpm = null; pending = 0; diagExtra = '';
   running = true;
   btn.textContent = 'Stop';
   statusEl.textContent = 'Listening... tempo needs about 4 seconds, the key about 5.';
   sampler = setInterval(sample, SAMPLE_MS);
   loop();
   timer = setInterval(estimate, HOP_MS);
-  keyTimer = setInterval(keyStep, KEY_STEP_MS);
+
+  // pitch features (root note, playing now, keyboard) are optional: if anything here fails, the tempo keeps working
+  try {
+    analyser2 = ctx.createAnalyser();
+    analyser2.fftSize = 16384; analyser2.smoothingTimeConstant = 0.5; analyser2.minDecibels = -120;
+    freqBuf = new Float32Array(analyser2.frequencyBinCount);
+    src.connect(analyser2);
+    resetKey();
+    keyTimer = setInterval(keyStep, KEY_STEP_MS);
+  } catch (e) {
+    analyser2 = null; diagExtra = ' · pitch off: ' + (e && e.message ? e.message : e);
+  }
 }
 
 function stop() {
@@ -133,10 +144,12 @@ function stop() {
   if (stream) stream.getTracks().forEach(t => t.stop());
   if (ctx) ctx.close();
   btn.textContent = 'Start listening';
-  statusEl.textContent = 'Stopped.';
+  statusEl.textContent = 'Stopped.'; diagEl.textContent = '';
 }
 
 const buf = new Float32Array(1024);
+let lastRms = 0, diagExtra = '';
+const diagEl = document.getElementById('diag');
 let lastBeatFlash = 0;
 
 // audio sampling runs on a fixed timer so tempo math never depends on frame rate
@@ -146,6 +159,7 @@ function sample() {
   let sum = 0;
   for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
   const rms = Math.sqrt(sum / buf.length);
+  lastRms = rms;
   const t = ctx.currentTime;
   envTimes.push(t); envVals.push(rms);
   while (envTimes.length && t - envTimes[0] > WINDOW_SEC) { envTimes.shift(); envVals.shift(); }
@@ -159,6 +173,8 @@ function loop() {
 }
 
 function estimate() {
+  diagEl.textContent = 'audio ' + ctx.state + ' · bass level ' + lastRms.toFixed(4) + ' · readings ' + envTimes.length + diagExtra;
+  if (ctx.state !== 'running') { statusEl.textContent = 'The browser paused audio. Tap Stop, then Start again.'; return; }
   if (envTimes.length < 60) return;
   const tNow = envTimes[envTimes.length-1];
   const dur = tNow - envTimes[0];
@@ -265,7 +281,10 @@ function nowStep() {
 
 // one slice of pitch content: find spectral peaks, fold them into 12 note classes
 function keyStep() {
-  if (!running) return;
+  try { keyStepInner(); } catch (e) { diagExtra = ' · pitch error: ' + (e && e.message ? e.message : e); }
+}
+function keyStepInner() {
+  if (!running || !analyser2) return;
   analyser2.getFloatFrequencyData(freqBuf);
   nowStep();
   const binHz = ctx.sampleRate / analyser2.fftSize;
@@ -286,6 +305,7 @@ function keyStep() {
     const m = Math.pow(10, b / 20);
     frame[((r % 12) + 12) % 12] += m; sum += m;
   }
+  diagExtra = ' · loudest pitch ' + (Number.isFinite(maxDb) ? Math.round(maxDb) + ' dB' : 'none');
   if (maxDb < KEY_FLOOR_DB || sum === 0) return;              // silence: keep what we had
   for (let i = 0; i < 12; i++) chroma[i] = chroma[i] * KEY_DECAY + frame[i] / sum;
   chromaWeight = chromaWeight * KEY_DECAY + 1;
@@ -416,7 +436,7 @@ function setLive(midiNote) {
   if (liveMidi === midiNote) return;
   liveMidi = midiNote; applyLive();
 }
-buildKeyboard();
+try { buildKeyboard(); } catch (e) { diagExtra = ' · keyboard error: ' + e.message; }
 
 // visual metronome pulse at the detected tempo
 let pulseTimer = null;
@@ -441,7 +461,8 @@ function draw() {
   }
   sctx.stroke();
 }
-renderScale(-1);
+try { renderScale(-1); } catch (e) { diagExtra = ' · keyboard error: ' + e.message; }
+window.addEventListener('error', (e) => { diagExtra = ' · error: ' + e.message; });
 </script>
 </body>
 </html>
