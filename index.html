@@ -18,6 +18,12 @@
   #pulse { width:36px; height:36px; border-radius:50%; background:#3ddc97; opacity:.15; transition:opacity .08s; }
   #pulse.on { opacity:1; }
   canvas { width:min(640px,92vw); height:120px; background:#16181d; border-radius:12px; }
+  #btns { display:flex; gap:12px; flex-wrap:wrap; justify-content:center; }
+  #tap { background:transparent; color:#3ddc97; border:2px solid #3ddc97; touch-action:manipulation; user-select:none; -webkit-user-select:none; }
+  #mul { display:flex; gap:12px; }
+  .small { background:transparent; color:#eee; border:1.5px solid #3a3f4a; padding:12px 18px; touch-action:manipulation; }
+  .small:active { border-color:#3ddc97; }
+  #tap:active { background:#3ddc97; color:#0e0f12; }
   button { background:#3ddc97; color:#0e0f12; border:0; border-radius:999px; padding:14px 34px; font-size:17px; font-weight:600; cursor:pointer; }
   #status { opacity:.55; font-size:14px; }
   #diag { opacity:.4; font-size:12px; font-variant-numeric:tabular-nums; }
@@ -49,7 +55,7 @@
     <div id="fingerTxt"></div>
   </div>
   <canvas id="scope" width="1280" height="240"></canvas>
-  <button id="btn">Start listening</button>
+  <div id="btns"><button id="btn">Start listening</button><button id="tap">Tap tempo</button><span id="mul"><button id="half" class="small">÷2</button><button id="dbl" class="small">×2</button></span></div>
   <div id="status">Tap start and play a song near the mic.</div>
   <div id="diag"></div>
 
@@ -58,14 +64,15 @@ const MIN_BPM = 70, MAX_BPM = 180;
 const WINDOW_SEC = 8;           // analysis window
 const HOP_MS = 500;             // re-estimate twice a second
 const RECENCY_SEC = 3;          // newer beats count more; older ones fade out of the vote
-const SAMPLE_MS = 20;           // fixed envelope sampling (50 Hz), independent of screen refresh
+const SAMPLE_MS = 10;           // fixed envelope sampling (100 Hz), independent of screen refresh
+const FPS = 100;                // the tempo math runs on an even 100 frames per second
 const MIN_LEVEL = 0.0004;       // only a dead or muted mic is below this; quiet music is fine
-const MIN_DEPTH = 0.15;         // the beat envelope must swing at least this much (steady hiss and hum barely swing)
-const MIN_SHARE = 0.5;          // this share of the tempo votes must agree (random noise votes scatter)
+const MIN_CONF = 0.07;          // how clearly one tempo must stand out before it is shown (lower = picks up weaker beats; steady hiss scores about 0.03)
+const MIN_REPEAT = 0.80;        // a real beat is still strong 3 beats later; random taps, clicks and speech fade (they score 0.76 or less)
 const PITCH_ABOVE_NOISE_DB = 16;// a pitch must stand this far above the spectrum's own noise level
 
-let ctx, analyser, stream, running = false;
-let envTimes = [], envVals = [];  // energy envelope history
+let ctx, analyser, analyserH = null, stream, running = false;
+let envTimes = [], envVals = [], envLow = [], envHigh = [];  // loudness history: bass band and high band
 let smoothBpm = null, pending = 0, timer = null, raf = null, sampler = null;
 
 // ---- root note / key detection ----
@@ -116,8 +123,14 @@ async function start() {
   analyser = ctx.createAnalyser();
   analyser.fftSize = 1024;
   src.connect(lp); lp.connect(analyser);
+  // high band (hi-hats, snares, claps): phone speakers and mics carry these far better than bass
+  const hp = ctx.createBiquadFilter();
+  hp.type = 'highpass'; hp.frequency.value = 1500; hp.Q.value = 0.7;
+  analyserH = ctx.createAnalyser();
+  analyserH.fftSize = 1024;
+  src.connect(hp); hp.connect(analyserH);
 
-  envTimes = []; envVals = []; smoothBpm = null; pending = 0; diagExtra = '';
+  envTimes = []; envVals = []; envLow = []; envHigh = []; smoothBpm = null; pending = 0; diagExtra = ''; failCount = 0; candBpm = 0; candStreak = 0; confAvg = null; repAvg = null; tempoMul = 1;
   running = true;
   btn.textContent = 'Stop';
   statusEl.textContent = 'Listening... tempo needs about 4 seconds, the key about 5.';
@@ -141,7 +154,7 @@ async function start() {
 function stop() {
   running = false;
   clearInterval(timer); clearInterval(sampler); clearInterval(keyTimer); clearInterval(pulseTimer); cancelAnimationFrame(raf);
-  bpmEl.textContent = '--';
+  if (!tapActive()) { bpmEl.textContent = '--'; labelEl.textContent = 'BPM'; }
   resetKey();
   pulse.classList.remove('on');
   if (stream) stream.getTracks().forEach(t => t.stop());
@@ -151,21 +164,26 @@ function stop() {
 }
 
 const buf = new Float32Array(1024);
-let lastRms = 0, diagExtra = '', lastDepth = 0, lastShare = 0, failCount = 0;
+let confAvg = null, repAvg = null;
+let lastRms = 0, diagExtra = '', lastConf = 0, lastRep = 0, lastQual = null, failCount = 0, candBpm = 0, candStreak = 0;
 const diagEl = document.getElementById('diag');
 let lastBeatFlash = 0;
 
 // audio sampling runs on a fixed timer so tempo math never depends on frame rate
+const bufH = new Float32Array(1024);
+function rmsOf(b) { let sum = 0; for (let i = 0; i < b.length; i++) sum += b[i] * b[i]; return Math.sqrt(sum / b.length); }
 function sample() {
   if (!running) return;
   analyser.getFloatTimeDomainData(buf);
-  let sum = 0;
-  for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
-  const rms = Math.sqrt(sum / buf.length);
-  lastRms = rms;
-  const t = ctx.currentTime;
-  envTimes.push(t); envVals.push(rms);
-  while (envTimes.length && t - envTimes[0] > WINDOW_SEC) { envTimes.shift(); envVals.shift(); }
+  const lo = rmsOf(buf);
+  let hi = 0;
+  if (analyserH) { analyserH.getFloatTimeDomainData(bufH); hi = rmsOf(bufH); }
+  lastRms = lo;
+  addSample(ctx.currentTime, lo, hi);
+}
+function addSample(t, lo, hi) {
+  envTimes.push(t); envLow.push(lo); envHigh.push(hi); envVals.push(lo + hi);
+  while (envTimes.length && t - envTimes[0] > WINDOW_SEC) { envTimes.shift(); envLow.shift(); envHigh.shift(); envVals.shift(); }
 }
 
 // drawing only; this can run at whatever rate the screen allows
@@ -176,92 +194,162 @@ function loop() {
 }
 
 function rhythmFail(msg) {
-  statusEl.textContent = msg;
-  if (++failCount >= 3) { smoothBpm = null; bpmEl.textContent = '--'; clearInterval(pulseTimer); }   // keep the last answer for a moment, then clear
+  statusEl.textContent = msg; candStreak = 0;
+  if (++failCount >= 3) { smoothBpm = null; if (!tapActive()) { bpmEl.textContent = '--'; labelEl.textContent = 'BPM'; } clearInterval(pulseTimer); }   // keep the last answer for a moment, then clear
+}
+
+// loudness history -> evenly spaced frames
+function resampleEnv(arr, tNow) {
+  const t0 = envTimes[0], n = Math.floor((tNow - t0) * FPS), out = new Float32Array(Math.max(0, n));
+  let j = 0;
+  for (let i = 0; i < n; i++) {
+    const t = t0 + i / FPS;
+    while (j < envTimes.length - 2 && envTimes[j + 1] < t) j++;
+    const a = envTimes[j], b = envTimes[j + 1], f = b > a ? Math.min(1, Math.max(0, (t - a) / (b - a))) : 0;
+    out[i] = arr[j] + (arr[j + 1] - arr[j]) * f;
+  }
+  return out;
+}
+// how much louder each moment is than the one before, scaled so quiet and loud music look alike
+function onsetOf(arr, tNow) {
+  const x = resampleEnv(arr, tNow), n = x.length;
+  const sorted = Array.from(x).sort((p, q) => p - q);
+  const ref = sorted[Math.floor(n * 0.95)] + 1e-9;
+  const l = new Float32Array(n);
+  for (let i = 0; i < n; i++) l[i] = Math.log(x[i] / ref + 0.05);
+  const o = new Float32Array(n);
+  for (let i = 1; i < n; i++) o[i] = Math.max(0, l[i] - l[i - 1]);
+  // remove the slow average (about 0.4 s) so only sudden rises count
+  const w = Math.round(FPS * 0.4), cs = new Float64Array(n + 1);
+  for (let i = 0; i < n; i++) cs[i + 1] = cs[i] + o[i];
+  const o2 = new Float32Array(n);
+  for (let i = 0; i < n; i++) { const a = Math.max(0, i - w), b = Math.min(n, i + w + 1); o2[i] = Math.max(0, o[i] - (cs[b] - cs[a]) / (b - a)); }
+  // light smoothing so a hit that falls between frames still lines up
+  const o3 = new Float32Array(n), k = [1, 2, 3, 2, 1];
+  for (let i = 0; i < n; i++) { let acc = 0; for (let j = -2; j <= 2; j++) { const m = i + j; if (m >= 0 && m < n) acc += o2[m] * k[j + 2]; } o3[i] = acc / 9; }
+  let mean = 0; for (let i = 0; i < n; i++) mean += o3[i]; mean /= n;
+  if (mean < 1e-9) return null;
+  for (let i = 0; i < n; i++) o3[i] /= mean;
+  return o3;
+}
+// find the tempo at which the onsets repeat most strongly, favouring the most recent seconds
+function tempoFromEnvelopes(tNow) {
+  const minLag = Math.floor(FPS * 60 / 200), maxLag = Math.ceil(FPS * 60 / 60);
+  const bands = [onsetOf(envLow, tNow), onsetOf(envHigh, tNow)].filter(Boolean);
+  if (!bands.length) return null;
+  const n = bands[0].length;
+  if (n < maxLag * 2 + 10) return null;
+  const wts = new Float32Array(n);
+  for (let i = 0; i < n; i++) wts[i] = Math.exp(-(n - i) / (RECENCY_SEC * FPS));
+  const R = new Float64Array(maxLag * 3 + 3);
+  for (const o of bands) {
+    const r = new Float64Array(maxLag * 3 + 3);
+    let r0 = 0, wsum = 0;
+    for (let i = 0; i < n; i++) { r0 += wts[i] * o[i] * o[i]; wsum += wts[i]; }
+    r0 = r0 / wsum + 1e-9;
+    for (let L = minLag - 1; L <= maxLag * 3 + 1 && L < n * 0.75; L++) {
+      let acc = 0, ws = 0;
+      for (let i = 0; i + L < n; i++) { acc += wts[i] * o[i] * o[i + L]; ws += wts[i]; }
+      r[L] = acc / ws / r0;
+    }
+    for (let L = 0; L < R.length; L++) R[L] += r[L];
+  }
+  let best = 0, bestScore = -1, sum = 0, cnt = 0;
+  for (let L = minLag; L <= maxLag; L++) {
+    const bpm = 60 * FPS / L;
+    const prior = Math.exp(-0.5 * Math.pow(Math.log2(bpm / 120) / 0.9, 2));
+    const sc = (R[L] + 0.5 * R[2 * L]) * (0.6 + 0.4 * prior);
+    sum += sc; cnt++;
+    if (sc > bestScore) { bestScore = sc; best = L; }
+  }
+  const y0 = R[best - 1], y1 = R[best], y2 = R[best + 1], d = y0 - 2 * y1 + y2;
+  const shift = d !== 0 ? 0.5 * (y0 - y2) / d : 0;
+  let bpm = 60 * FPS / (best + Math.max(-1, Math.min(1, shift)));
+  while (bpm < MIN_BPM) bpm *= 2;
+  while (bpm > MAX_BPM) bpm /= 2;
+  const conf = Math.max(0, Math.min(1, (bestScore / (sum / cnt) - 1) / 6));
+  const at = (m) => { const L = best * m; return L + 1 < R.length ? Math.max(R[L - 1], R[L], R[L + 1]) : 0; };
+  const repeat = best * 3 < n * 0.75 && at(1) > 0 ? at(3) / at(1) : 1;   // too slow to measure 3 beats ahead: give the benefit of the doubt
+  return { bpm, conf, repeat, r1: at(1), r2: at(2), r3: at(3), base: sum / cnt, lag: best };
 }
 
 function estimate() {
-  diagEl.textContent = 'audio ' + ctx.state + ' · bass level ' + lastRms.toFixed(4) + ' · readings ' + envTimes.length + ' · rhythm ' + lastDepth.toFixed(2) + '/' + lastShare.toFixed(2) + diagExtra;
+  diagEl.textContent = 'audio ' + ctx.state + ' · bass ' + lastRms.toFixed(4) + ' · readings ' + envTimes.length + ' · rhythm ' + lastConf.toFixed(2) + ' · steady ' + lastRep.toFixed(2) + diagExtra;
   if (ctx.state !== 'running') { statusEl.textContent = 'The browser paused audio. Tap Stop, then Start again.'; return; }
-  if (envTimes.length < 60) return;
-  const tNow = envTimes[envTimes.length-1];
+  if (envTimes.length < 100) return;
+  const tNow = envTimes[envTimes.length - 1];
   const dur = tNow - envTimes[0];
   if (dur < 4) return;
 
-  // silence gate: if the signal never gets loud, there is no music to measure
-  let peakLevel = 0;
-  for (const v of envVals) if (v > peakLevel) peakLevel = v;
-  if (peakLevel < MIN_LEVEL) {
-    smoothBpm = null;
-    bpmEl.textContent = '--';
+  // only a dead or muted mic counts as silence; quiet music is still analysed
+  let pk = 0;
+  for (const v of envVals) if (v > pk) pk = v;
+  if (pk < MIN_LEVEL) {
+    smoothBpm = null; lastConf = 0; confAvg = null; repAvg = null;
+    if (!tapActive()) { bpmEl.textContent = '--'; labelEl.textContent = 'BPM'; }
     clearInterval(pulseTimer);
     statusEl.textContent = 'Nothing heard. Check that the mic is on, or turn the music up.';
     return;
   }
 
-  // steady noise (hiss, hum, fan) hardly changes in loudness; music with a beat swings a lot
-  const sortedEnv = Array.from(envVals).sort((p, q) => p - q);
-  const p10 = sortedEnv[Math.floor(sortedEnv.length * 0.1)], p90 = sortedEnv[Math.floor(sortedEnv.length * 0.9)];
-  lastDepth = (p90 - p10) / (p90 + 1e-9);
-  if (lastDepth < MIN_DEPTH) return rhythmFail('Only steady sound heard, no beat to measure.');
-
-  // onset strength = positive change in smoothed energy
-  const n = envVals.length;
-  const sm = new Float32Array(n);
-  for (let i = 0; i < n; i++) {
-    let a = 0, c = 0;
-    for (let k = -2; k <= 2; k++) { const j = i + k; if (j >= 0 && j < n) { a += envVals[j]; c++; } }
-    sm[i] = a / c;
-  }
-  const onset = new Float32Array(n);
-  for (let i = 1; i < n; i++) onset[i] = Math.max(0, sm[i] - sm[i-1]);
-
-  // adaptive threshold peak picking
-  let mean = 0; for (const v of onset) mean += v; mean /= n;
-  let varr = 0; for (const v of onset) varr += (v-mean)*(v-mean);
-  const thr = mean + Math.sqrt(varr / n) * 1.2;
-  const peaks = [];
-  for (let i = 2; i < n-2; i++) {
-    if (onset[i] > thr && onset[i] >= onset[i-1] && onset[i] >= onset[i+1]) {
-      const t = envTimes[i];
-      if (!peaks.length || t - peaks[peaks.length-1] > 0.25) peaks.push(t);
-    }
-  }
-  if (peaks.length < 5) return rhythmFail('Not hearing a clear beat yet...');
-
-  // histogram vote on inter-peak intervals (also test 2x and 3x gaps), recent beats weighted higher
-  const bins = new Float32Array(MAX_BPM + 2);
-  for (let i = 0; i < peaks.length; i++) {
-    for (let j = i+1; j < Math.min(i+4, peaks.length); j++) {
-      let bpm = 60 / ((peaks[j]-peaks[i]) / (j-i));
-      while (bpm < MIN_BPM) bpm *= 2;
-      while (bpm > MAX_BPM) bpm /= 2;
-      const b = Math.round(bpm);
-      const wgt = Math.exp(-(tNow - peaks[j]) / RECENCY_SEC);
-      if (b >= MIN_BPM && b <= MAX_BPM) {
-        bins[b] += wgt; bins[b-1] += 0.5 * wgt; bins[b+1] += 0.5 * wgt;
-      }
-    }
-  }
-  let best = MIN_BPM, bestV = 0;
-  for (let b = MIN_BPM; b <= MAX_BPM; b++) if (bins[b] > bestV) { bestV = bins[b]; best = b; }
-
-  // do the tempo votes agree, or are they scattered like noise?
-  let total = 0; for (let b = MIN_BPM; b <= MAX_BPM; b++) total += bins[b];
-  let near = 0; for (let b = Math.max(MIN_BPM, best - 3); b <= Math.min(MAX_BPM, best + 3); b++) near += bins[b];
-  lastShare = total > 0 ? near / total : 0;
-  if (lastShare < MIN_SHARE) return rhythmFail('Sound is there but no steady beat yet...');
+  const r = tempoFromEnvelopes(tNow);
+  lastConf = r ? r.conf : 0; lastQual = r;
+  // judge on a running average over the last couple of seconds: music scores steadily, noise bounces around
+  if (r) { confAvg = confAvg === null ? r.conf : 0.7 * confAvg + 0.3 * r.conf; repAvg = repAvg === null ? r.repeat : 0.7 * repAvg + 0.3 * r.repeat; }
+  lastRep = repAvg === null ? 0 : repAvg;
+  if (!r || confAvg < MIN_CONF) return rhythmFail('Not hearing a steady beat yet. Tap tempo works too.');
+  if (repAvg < MIN_REPEAT) return rhythmFail('Sound is there but the beat is not steady. Tap tempo works too.');
   failCount = 0;
+  const best = r.bpm;
+
+  // before the first answer, the same tempo must come up 3 times running: real music repeats itself, random noise does not
+  if (smoothBpm === null) {
+    if (candBpm && Math.abs(best - candBpm) / candBpm < 0.04) candStreak++; else { candBpm = best; candStreak = 1; }
+    if (candStreak < 3) { statusEl.textContent = 'Hearing something rhythmic, confirming...'; return; }
+  }
+
   // follow small drift smoothly; jump when a clearly different tempo shows up twice in a row
   if (smoothBpm === null) { smoothBpm = best; pending = 0; }
   else if (Math.abs(best - smoothBpm) / smoothBpm > 0.06) {
     pending++;
     if (pending >= 2) { smoothBpm = best; pending = 0; }
   } else { pending = 0; smoothBpm = smoothBpm * 0.5 + best * 0.5; }
-  bpmEl.textContent = Math.round(smoothBpm);
-  statusEl.textContent = 'Locked on. Peaks heard: ' + peaks.length;
-  flash(60 / smoothBpm);
+  if (!tapActive()) {
+    bpmEl.textContent = Math.round(smoothBpm * tempoMul); labelEl.textContent = 'BPM';
+    flash(60 / (smoothBpm * tempoMul));
+    statusEl.textContent = 'Locked on. Rhythm strength ' + Math.round(r.conf * 100) + '%';
+  }
 }
+
+// ---- tap tempo: works with or without the mic ----
+let tempoMul = 1;   // set by the ÷2 / ×2 buttons when the detector locks on to half or double the tempo you feel
+let taps = [], tapUntil = 0;
+const tapBtn = document.getElementById('tap');
+const labelEl = document.getElementById('label');
+function tapActive() { return performance.now() < tapUntil; }
+function doTap() {
+  const now = performance.now();
+  if (taps.length && now - taps[taps.length - 1] > 2500) taps = [];   // a long pause starts a new count
+  taps.push(now);
+  if (taps.length > 8) taps.shift();
+  if (taps.length < 2) { statusEl.textContent = 'Tap again on the next beat...'; return; }
+  const bpm = 60000 / ((taps[taps.length - 1] - taps[0]) / (taps.length - 1));
+  bpmEl.textContent = Math.round(bpm); labelEl.textContent = 'BPM · TAP';
+  tapUntil = now + 8000;
+  statusEl.textContent = 'Tap tempo from ' + taps.length + ' taps. Keep tapping with the beat.';
+  flash(60 / bpm);
+}
+function applyMul(f) {
+  if (smoothBpm === null || tapActive()) return;
+  const next = smoothBpm * tempoMul * f;
+  if (next < 30 || next > 300) return;
+  tempoMul *= f;
+  bpmEl.textContent = Math.round(smoothBpm * tempoMul); flash(60 / (smoothBpm * tempoMul));
+}
+document.getElementById('half').addEventListener('click', () => applyMul(0.5));
+document.getElementById('dbl').addEventListener('click', () => applyMul(2));
+tapBtn.addEventListener('pointerdown', (e) => { e.preventDefault(); doTap(); });
+tapBtn.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); doTap(); } });
 
 function resetKey() {
   chroma = new Float64Array(12); chromaWeight = 0; shownKey = -1; candKey = -1; candCount = 0;
