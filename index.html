@@ -9,17 +9,44 @@
   body { margin:0; min-height:100vh; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:20px; background:#0e0f12; color:#eee; font-family:-apple-system,system-ui,sans-serif; }
   #bpm { font-size:110px; font-weight:700; letter-spacing:-3px; }
   #label { opacity:.6; margin-top:-24px; letter-spacing:4px; font-size:14px; }
+  #notes { display:flex; gap:20px 56px; justify-content:center; flex-wrap:wrap; }
+  .nb { display:flex; flex-direction:column; align-items:center; gap:2px; min-width:120px; }
+  .nl { opacity:.6; letter-spacing:4px; font-size:14px; }
+  .nv { font-size:72px; font-weight:700; letter-spacing:-2px; line-height:1; min-height:1em; }
+  #now { color:#3ddc97; }
+  .ns { opacity:.7; font-size:15px; min-height:1.2em; }
   #pulse { width:36px; height:36px; border-radius:50%; background:#3ddc97; opacity:.15; transition:opacity .08s; }
   #pulse.on { opacity:1; }
   canvas { width:min(640px,92vw); height:120px; background:#16181d; border-radius:12px; }
   button { background:#3ddc97; color:#0e0f12; border:0; border-radius:999px; padding:14px 34px; font-size:17px; font-weight:600; cursor:pointer; }
   #status { opacity:.55; font-size:14px; }
+  #kbwrap { width:min(640px,94vw); display:flex; flex-direction:column; gap:8px; align-items:center; }
+  #kb { width:100%; height:auto; display:block; }
+  .wk { fill:#e9eaee; stroke:#4a4f5a; stroke-width:1; }
+  .wk.sc { fill:#aef0d5; } .wk.rt { fill:#ffb454; }
+  .bk { fill:#1a1c21; stroke:#000; stroke-width:1; }
+  .bk.sc { fill:#1f9e75; } .bk.rt { fill:#d98a1f; }
+  .live { stroke:#5aa9ff !important; stroke-width:3.5 !important; }
+  .nt { font-size:10px; text-anchor:middle; fill:#12141a; font-weight:600; pointer-events:none; }
+  .nt.on-black { fill:#fff; }
+  .fg { font-size:13px; text-anchor:middle; fill:#3ddc97; font-weight:700; }
+  #scaleTxt { font-size:15px; opacity:.85; text-align:center; }
+  #fingerTxt { font-size:13px; opacity:.6; text-align:center; max-width:46ch; }
 </style>
 </head>
 <body>
   <div id="bpm">--</div>
   <div id="label">BPM</div>
+  <div id="notes">
+    <div class="nb"><div class="nl">ROOT NOTE</div><div class="nv" id="root">--</div><div class="ns" id="mode"></div></div>
+    <div class="nb"><div class="nl">PLAYING NOW</div><div class="nv" id="now">--</div><div class="ns" id="nowhz"></div></div>
+  </div>
   <div id="pulse"></div>
+  <div id="kbwrap">
+    <svg id="kb" viewBox="0 0 420 130" role="img" aria-label="Piano keyboard showing the scale of the detected key"></svg>
+    <div id="scaleTxt"></div>
+    <div id="fingerTxt"></div>
+  </div>
   <canvas id="scope" width="1280" height="240"></canvas>
   <button id="btn">Start listening</button>
   <div id="status">Tap start and play a song near the mic.</div>
@@ -35,6 +62,26 @@ const MIN_LEVEL = 0.01;         // below this loudness we call it silence
 let ctx, analyser, stream, running = false;
 let envTimes = [], envVals = [];  // energy envelope history
 let smoothBpm = null, pending = 0, timer = null, raf = null, sampler = null;
+
+// ---- root note / key detection ----
+const NOTES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+const ROOT_MAJ = ['C','Db','D','Eb','E','F','F#','G','Ab','A','Bb','B'];   // conventional key names
+const ROOT_MIN = ['C','C#','D','Eb','E','F','F#','G','G#','A','Bb','B'];
+const MAJ = [6.35,2.23,3.48,2.33,4.38,4.09,2.52,5.19,2.39,3.66,2.29,2.88];   // Krumhansl-Kessler key profiles
+const MIN = [6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34,3.17];
+const KEY_STEP_MS = 250;
+const KEY_DECAY = Math.pow(0.5, KEY_STEP_MS / 8000);   // pitch memory fades with an 8 s half-life
+const KEY_MIN_WEIGHT = 16;                              // about 5 s of music before the first answer
+const KEY_FLOOR_DB = -70;                               // quieter than this is treated as no music
+let analyser2 = null, freqBuf = null, keyTimer = null;
+let chroma = new Float64Array(12), chromaWeight = 0;
+let shownKey = -1, candKey = -1, candCount = 0;
+const NOTE_FLOOR_DB = -65;
+let nowCand = '', nowCount = 0, nowQuiet = 0;
+const nowEl = document.getElementById('now');
+const nowHzEl = document.getElementById('nowhz');
+const rootEl = document.getElementById('root');
+const modeEl = document.getElementById('mode');
 
 const bpmEl = document.getElementById('bpm');
 const statusEl = document.getElementById('status');
@@ -60,20 +107,28 @@ async function start() {
   analyser = ctx.createAnalyser();
   analyser.fftSize = 1024;
   src.connect(lp); lp.connect(analyser);
+  // second analyser, full range and finer resolution, for pitch content
+  analyser2 = ctx.createAnalyser();
+  analyser2.fftSize = 16384; analyser2.smoothingTimeConstant = 0.5; analyser2.minDecibels = -120;
+  freqBuf = new Float32Array(analyser2.frequencyBinCount);
+  src.connect(analyser2);
+  resetKey();
 
   envTimes = []; envVals = []; smoothBpm = null; pending = 0;
   running = true;
   btn.textContent = 'Stop';
-  statusEl.textContent = 'Listening... needs about 4 seconds of music.';
+  statusEl.textContent = 'Listening... tempo needs about 4 seconds, the key about 5.';
   sampler = setInterval(sample, SAMPLE_MS);
   loop();
   timer = setInterval(estimate, HOP_MS);
+  keyTimer = setInterval(keyStep, KEY_STEP_MS);
 }
 
 function stop() {
   running = false;
-  clearInterval(timer); clearInterval(sampler); clearInterval(pulseTimer); cancelAnimationFrame(raf);
+  clearInterval(timer); clearInterval(sampler); clearInterval(keyTimer); clearInterval(pulseTimer); cancelAnimationFrame(raf);
   bpmEl.textContent = '--';
+  resetKey();
   pulse.classList.remove('on');
   if (stream) stream.getTracks().forEach(t => t.stop());
   if (ctx) ctx.close();
@@ -172,6 +227,197 @@ function estimate() {
   flash(60 / smoothBpm);
 }
 
+function resetKey() {
+  chroma = new Float64Array(12); chromaWeight = 0; shownKey = -1; candKey = -1; candCount = 0;
+  rootEl.textContent = '--'; modeEl.textContent = '';
+  if (typeof renderScale === 'function') { renderScale(-1); setLive(-1); }
+  nowCand = ''; nowCount = 0; nowQuiet = 0; nowEl.textContent = '--'; nowHzEl.textContent = '';
+}
+
+// strongest pitch in the current spectrum; if its octave-below partner is also present, report that instead
+function nowStep() {
+  const binHz = ctx.sampleRate / analyser2.fftSize;
+  const lo = Math.ceil(80 / binHz), hi = Math.floor(1500 / binHz);
+  let bk = -1, bd = -Infinity;
+  for (let k = lo; k <= hi; k++) {
+    const b = freqBuf[k];
+    if (Number.isFinite(b) && b > bd && b > freqBuf[k-1] && b >= freqBuf[k+1]) { bd = b; bk = k; }
+  }
+  if (bk < 0 || bd < NOTE_FLOOR_DB) {
+    if (++nowQuiet >= 4) { nowCand = ''; nowCount = 0; nowEl.textContent = '--'; nowHzEl.textContent = ''; setLive(-1); }
+    return;
+  }
+  nowQuiet = 0;
+  const refine = (k) => { const a = freqBuf[k-1], b = freqBuf[k], c = freqBuf[k+1], d = a - 2*b + c; return (k + (d !== 0 ? 0.5 * (a - c) / d : 0)) * binHz; };
+  let f0 = refine(bk);
+  for (let pass = 0; pass < 2; pass++) {
+    const kk = Math.round(f0 / 2 / binHz);
+    if (f0 / 2 < 70 || kk < 3) break;
+    let mk = -1, md = -Infinity;
+    for (let k = kk - 2; k <= kk + 2; k++) if (freqBuf[k] > md && freqBuf[k] > freqBuf[k-1] && freqBuf[k] >= freqBuf[k+1]) { md = freqBuf[k]; mk = k; }
+    if (mk > 0 && md >= bd - 8) f0 = refine(mk); else break;
+  }
+  const r = Math.round(69 + 12 * Math.log2(f0 / 440));
+  const name = NOTES[((r % 12) + 12) % 12] + (Math.floor(r / 12) - 1);
+  if (name === nowCand) nowCount++; else { nowCand = name; nowCount = 1; }
+  if (nowCount >= 2) { nowEl.textContent = name; nowHzEl.textContent = Math.round(f0) + ' Hz'; setLive(r); }
+}
+
+// one slice of pitch content: find spectral peaks, fold them into 12 note classes
+function keyStep() {
+  if (!running) return;
+  analyser2.getFloatFrequencyData(freqBuf);
+  nowStep();
+  const binHz = ctx.sampleRate / analyser2.fftSize;
+  const lo = Math.max(2, Math.ceil(70 / binHz)), hi = Math.floor(2200 / binHz);
+  const frame = new Float64Array(12);
+  let sum = 0, maxDb = -Infinity;
+  for (let k = lo; k <= hi; k++) {
+    const b = freqBuf[k];
+    if (!Number.isFinite(b)) continue;
+    if (b > maxDb) maxDb = b;
+    const a = freqBuf[k-1], c = freqBuf[k+1];
+    if (b < KEY_FLOOR_DB || !(b > a) || !(b >= c)) continue;
+    const den = a - 2*b + c;
+    const delta = den !== 0 ? 0.5 * (a - c) / den : 0;       // refine the peak between bins
+    const midi = 69 + 12 * Math.log2(((k + delta) * binHz) / 440);
+    const r = Math.round(midi);
+    if (Math.abs(midi - r) > 0.35) continue;                  // between notes, ignore
+    const m = Math.pow(10, b / 20);
+    frame[((r % 12) + 12) % 12] += m; sum += m;
+  }
+  if (maxDb < KEY_FLOOR_DB || sum === 0) return;              // silence: keep what we had
+  for (let i = 0; i < 12; i++) chroma[i] = chroma[i] * KEY_DECAY + frame[i] / sum;
+  chromaWeight = chromaWeight * KEY_DECAY + 1;
+  if (chromaWeight < KEY_MIN_WEIGHT) { modeEl.textContent = 'Listening for the key...'; return; }
+
+  // correlate against all 24 major and minor keys
+  const scores = [];
+  for (let m = 0; m < 2; m++) {
+    const prof = m ? MIN : MAJ;
+    for (let r = 0; r < 12; r++) {
+      let mx = 0, my = 0;
+      for (let i = 0; i < 12; i++) { mx += chroma[i]; my += prof[i]; }
+      mx /= 12; my /= 12;
+      let sxy = 0, sxx = 0, syy = 0;
+      for (let i = 0; i < 12; i++) {
+        const x = chroma[(i + r) % 12] - mx, y = prof[i] - my;
+        sxy += x * y; sxx += x * x; syy += y * y;
+      }
+      scores.push({ id: m * 12 + r, s: sxy / Math.sqrt(sxx * syy + 1e-12) });
+    }
+  }
+  scores.sort((p, q) => q.s - p.s);
+  const best = scores[0], margin = best.s - scores[1].s;
+  // only switch the display after the same answer shows up 3 times in a row
+  if (best.id === candKey) candCount++; else { candKey = best.id; candCount = 1; }
+  const prevShown = shownKey;
+  if (shownKey < 0 || (candKey !== shownKey && candCount >= 3)) shownKey = candKey;
+  if (shownKey !== prevShown) renderScale(shownKey);
+  const shownScore = scores.find(x => x.id === shownKey);
+  const conf = shownKey === best.id ? (margin > 0.08 ? 'strong' : margin > 0.03 ? 'moderate' : 'weak') : 'weak';
+  rootEl.textContent = (shownKey >= 12 ? ROOT_MIN : ROOT_MAJ)[shownKey % 12];
+  modeEl.textContent = (shownKey >= 12 ? 'minor' : 'major') + ' key · ' + conf;
+}
+
+// ---- keyboard: C3 to C5, scale keys lit, root marked, live note ringed ----
+const KB_LOW = 48, KB_HIGH = 72, WK_W = 28, KB_TOP = 26;
+const WHITE_PC = [0, 2, 4, 5, 7, 9, 11];
+const kb = document.getElementById('kb');
+const scaleTxt = document.getElementById('scaleTxt');
+const fingerTxt = document.getElementById('fingerTxt');
+const keyEls = {}, noteEls = {}, fingerEls = {};
+const SVGNS = 'http://www.w3.org/2000/svg';
+function svgEl(tag, attrs, text) {
+  const e = document.createElementNS(SVGNS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (text != null) e.textContent = text;
+  return e;
+}
+function buildKeyboard() {
+  let wi = 0; const blacks = [];
+  for (let m = KB_LOW; m <= KB_HIGH; m++) {
+    const pc = m % 12;
+    if (WHITE_PC.includes(pc)) {
+      const x = wi * WK_W;
+      const r = svgEl('rect', { x, y: KB_TOP, width: WK_W, height: 100, rx: 3, class: 'wk' });
+      kb.appendChild(r); keyEls[m] = r;
+      const t = svgEl('text', { x: x + WK_W / 2, y: KB_TOP + 92, class: 'nt' }, '');
+      kb.appendChild(t); noteEls[m] = t;
+      fingerEls[m] = { x: x + WK_W / 2 };
+      wi++;
+    } else blacks.push({ m, x: wi * WK_W });
+  }
+  for (const b of blacks) {
+    const r = svgEl('rect', { x: b.x - 9, y: KB_TOP, width: 18, height: 62, rx: 2, class: 'bk' });
+    kb.appendChild(r); keyEls[b.m] = r;
+    const t = svgEl('text', { x: b.x, y: KB_TOP + 52, class: 'nt on-black' }, '');
+    kb.appendChild(t); noteEls[b.m] = t;
+    fingerEls[b.m] = { x: b.x };
+  }
+}
+// standard right-hand fingerings for one octave, only for keys where the pattern is well established
+const FING_A = [1,2,3,1,2,3,4,5], FING_F = [1,2,3,4,1,2,3,4];
+const FINGERING = {
+  major: { 0: FING_A, 7: FING_A, 2: FING_A, 9: FING_A, 4: FING_A, 11: FING_A, 5: FING_F },
+  minor: { 9: FING_A, 4: FING_A, 11: FING_A, 2: FING_A, 7: FING_A, 0: FING_A, 5: FING_F }
+};
+const MAJ_STEPS = [0, 2, 4, 5, 7, 9, 11], MIN_STEPS = [0, 2, 3, 5, 7, 8, 10];
+const LETTERS = ['C', 'D', 'E', 'F', 'G', 'A', 'B'], LETTER_PC = [0, 2, 4, 5, 7, 9, 11];
+function spellScale(rootName, steps, rootPc) {
+  const li = LETTERS.indexOf(rootName[0]);
+  return steps.map((st, i) => {
+    const L = (li + i) % 7, pc = (rootPc + st) % 12;
+    const d = ((pc - LETTER_PC[L] + 18) % 12) - 6;
+    return LETTERS[L] + (d > 0 ? '#'.repeat(d) : d < 0 ? 'b'.repeat(-d) : '');
+  });
+}
+let fingerNodes = [];
+function renderScale(keyId) { renderScaleCore(keyId); applyLive(); }
+function renderScaleCore(keyId) {
+  fingerNodes.forEach(n => n.remove()); fingerNodes = [];
+  for (const m in keyEls) {
+    keyEls[m].setAttribute('class', (WHITE_PC.includes(m % 12) ? 'wk' : 'bk'));
+    noteEls[m].textContent = '';
+  }
+  if (keyId < 0) { scaleTxt.textContent = 'Play a song and the keys of its scale will light up here.'; fingerTxt.textContent = ''; return; }
+  const minor = keyId >= 12, rootPc = keyId % 12;
+  const name = (minor ? ROOT_MIN : ROOT_MAJ)[rootPc];
+  const steps = minor ? MIN_STEPS : MAJ_STEPS;
+  const names = spellScale(name, steps, rootPc);
+  const inScale = new Map(steps.map((st, i) => [(rootPc + st) % 12, names[i]]));
+  for (const m in keyEls) {
+    const pc = m % 12, base = WHITE_PC.includes(pc) ? 'wk' : 'bk';
+    if (inScale.has(pc)) {
+      keyEls[m].setAttribute('class', base + (pc === rootPc ? ' rt' : ' sc'));
+      noteEls[m].textContent = inScale.get(pc);
+    }
+  }
+  scaleTxt.textContent = name + (minor ? ' minor' : ' major') + ' scale: ' + names.join(' ') + ' ' + names[0];
+  const fing = FINGERING[minor ? 'minor' : 'major'][rootPc];
+  if (!fing) { fingerTxt.textContent = 'Finger numbers are not shown for this key. Play the lit keys.'; return; }
+  // first run: lowest root in range, up one octave through the scale
+  let m = KB_LOW + rootPc;
+  const run = [m]; for (let i = 1; i < steps.length; i++) run.push(KB_LOW + rootPc + steps[i]); run.push(m + 12);
+  run.forEach((note, i) => {
+    const f = svgEl('text', { x: fingerEls[note].x, y: 17, class: 'fg' }, String(fing[i]));
+    kb.appendChild(f); fingerNodes.push(f);
+  });
+  fingerTxt.textContent = 'Right hand, one octave up from the lowest ' + name + ': ' + fing.join(' ') + '. Green numbers are finger numbers (1 = thumb).';
+}
+var liveMidi = -1;
+function applyLive() {
+  for (const m in keyEls) keyEls[m].classList.remove('live');
+  if (liveMidi < 0) return;
+  const pc = ((liveMidi % 12) + 12) % 12;
+  for (const m in keyEls) if (m % 12 === pc) keyEls[m].classList.add('live');
+}
+function setLive(midiNote) {
+  if (liveMidi === midiNote) return;
+  liveMidi = midiNote; applyLive();
+}
+buildKeyboard();
+
 // visual metronome pulse at the detected tempo
 let pulseTimer = null;
 function flash(periodSec) {
@@ -195,6 +441,7 @@ function draw() {
   }
   sctx.stroke();
 }
+renderScale(-1);
 </script>
 </body>
 </html>
